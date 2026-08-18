@@ -1,4 +1,5 @@
 import os
+import json
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
@@ -14,7 +15,7 @@ SYSTEM_PROMPT = """너는 1976년 MCM 뮌헨 아틀리에의 제품 사진작가
 촬영 테이블 위에는 '여행용 프로토타입, 조명 측정기, 회색 배경판' 세 가지만 있었다고 자상하게 알려주어라.
 (비밀) 실상은 패턴 사진이 아쉬워 몰래 시안을 챙겨 15시 52분에 추가 촬영을 진행했으며, 콘택트시트(촬영 기록 사진)에 시안이 함께 찍혀 있어 증언과 모순된다.
 
-[지식 제한 및 추측 방지]:
+[지식 제한 및 추측 방지 (Hallucination 제어)]:
 - 주어진 사건 정보(시간, 물건, 장소, 본인의 알리바이)에서 벗어난 내용이나 모르는 내용을 질문받으면 절대 임의로 추측하거나 지어내서 답하지 마라.
 - 모르는 정보에 대해서는 "허허, 그건 내 담당 밖이라 잘 모르겠구나." 또는 "글쎄다, 내가 보지 못한 걸 지어내서 말해줄 수는 없잖니~"라며 요하네스의 푸근하고 다정한 말투로 모른다는 사실을 부드럽게 밝혀라.
 
@@ -33,30 +34,57 @@ SYSTEM_PROMPT = """너는 1976년 MCM 뮌헨 아틀리에의 제품 사진작가
     * 엉뚱한 질문: 엉뚱한 소리를 자상하게 받아주면서도, 본인의 촬영 알리바이 상황과 연결해 자연스럽게 마무리 대사를 출력하라. (예: "허허, 저녁 회식 메뉴를 챙길 만큼 여유가 생겼나 보구나. 하지만 지금은 내 15시 40분 알리바이가 더 중요하지 않겠니? 마침 질문 기회도 끝났으니 스튜디오의 촬영 콘택트시트(QR 단서)나 가서 확인해 보렴.")
 """
 
-async def get_johannes_response(session_id: str, user_message: str) -> str:
+async def get_johannes_init(session_id: str) -> dict:
     if session_id not in sessions:
-        sessions[session_id] = {
-            "count": 0,
-            "messages": [{"role": "system", "content": SYSTEM_PROMPT}]
-        }
+        sessions[session_id] = {"count": 0, "messages": [{"role": "system", "content": SYSTEM_PROMPT}]}
+    
+    session = sessions[session_id]
+    
+    if len(session["messages"]) > 1:
+        for msg in session["messages"]:
+            if msg["role"] == "assistant":
+                return json.loads(msg["content"])
+
+    init_message = "[System Note: 사용자가 방금 채팅방에 입장했습니다. 사건 당일 당신의 알리바이에 대한 '첫 증언'을 합니다.]"
+    session["messages"].append({"role": "user", "content": init_message})
+    
+    bot_reply_dict = {
+        "reply": "저는 완성된 가방만 촬영했습니다. 종이 시안이나 아카이브 포트폴리오는 촬영에 필요하지 않았어요. 촬영도 예정보다 일찍 끝났습니다.",
+        "recommended_question": "촬영은 정확히 몇 시에 끝났나요?"
+    }
+    
+    bot_reply_str = json.dumps(bot_reply_dict, ensure_ascii=False)
+    session["messages"].append({"role": "assistant", "content": bot_reply_str})
+    
+    return bot_reply_dict
+
+async def get_johannes_response(session_id: str, user_message: str) -> dict:
+    if session_id not in sessions:
+        sessions[session_id] = {"count": 0, "messages": [{"role": "system", "content": SYSTEM_PROMPT}]}
     
     session = sessions[session_id]
     
     if session["count"] >= 3:
-        return "더 이상 질문할 수 없습니다. 현장 단서를 확인하세요."
+        return {
+            "reply": "더 이상 질문할 수 없습니다. 현장 단서를 확인하세요.",
+            "recommended_question": ""
+        }
     
     session["count"] += 1
-    
     context_message = f"[System Note: 현재 사용자의 {session['count']}번째 질문입니다.]\n{user_message}"
     session["messages"].append({"role": "user", "content": context_message})
     
     response = await client.chat.completions.create(
         model="gpt-5.6-terra",
+        response_format={"type": "json_object"},
         messages=session["messages"],
-        max_completion_tokens=150
+        max_completion_tokens=250
     )
     
-    bot_reply = response.choices[0].message.content
-    session["messages"].append({"role": "assistant", "content": bot_reply})
+    bot_reply_str = response.choices[0].message.content
+    session["messages"].append({"role": "assistant", "content": bot_reply_str})
     
-    return bot_reply
+    try:
+        return json.loads(bot_reply_str)
+    except json.JSONDecodeError:
+        return {"reply": "오류가 발생했습니다.", "recommended_question": ""}

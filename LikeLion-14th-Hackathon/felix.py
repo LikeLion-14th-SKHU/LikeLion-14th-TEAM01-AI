@@ -1,4 +1,5 @@
 import os
+import json
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
@@ -18,7 +19,7 @@ SYSTEM_PROMPT = """너는 1976년 MCM 뮌헨 아틀리에의 제품 구조 설�
 너는 16시 40분에 외부 미팅을 위해 퇴실했고 다시 돌아오지 않았다.
 에밀이 설계통을 본 적 없다고 주장하는 것은 거짓이거나, 누군가 네 부재중에 몰래 가져간 것이다.
 
-[지식 제한 및 추측 방지]:
+[지식 제한 및 추측 방지 (Hallucination 제어)]:
 - 주어진 사건 정보(시간, 물건, 장소, 본인의 알리바이)에서 벗어난 내용이나 모르는 내용을 질문받으면 절대 임의로 추측하거나 지어내서 답하지 마라.
 - 모르는 정보에 대해서는 "제 기록에 없는 정보입니다. 알지 못하는 내용을 추측해서 말씀드릴 수는 없군요." 또는 "그 부분은 제 담당 업무가 아니니 다른 분께 확인하시죠."라며 펠릭스의 차갑고 건조한 완벽주의자 말투로 모른다는 사실을 단호하게 밝혀라.
 
@@ -35,39 +36,81 @@ SYSTEM_PROMPT = """너는 1976년 MCM 뮌헨 아틀리에의 제품 구조 설�
 - 3번째 질문 (마지막 질문):
     * 답변을 마친 후, "질문 기회가 끝났으니 이제 현장 단서(QR)나 확인해 보시죠"라는 어조로 대화를 마무리하라.
     * 엉뚱한 질문: 엉뚱한 소리에 정색하며 본인의 사건 상황(B-02 설계통 사라짐 등)과 연결해 한심하다는 듯 쳐낸 뒤, 대화를 즉시 마무리하라. (예: "지금 B-02 설계통이 사라진 마당에 회식 메뉴 같은 한가한 소리가 나옵니까? 어차피 질문 기회도 끝났으니, 이제 현장 단서(QR)나 확인해 보시죠.")
+
+[추천 질문 동적 생성 및 JSON 출력 규칙 - 반드시 준수할 것]
+너는 용의자로서 대답을 하는 동시에, 게임 플레이어(사용자)가 사건의 진실에 다가가기 위한 질문을 할 수 있게 하기 위해 다음 추리 단계를 안내하는 '추천 질문' 1개를 생성해야 한다.
+반드시 아래의 JSON 형식으로만 응답을 반환하라. (일반 텍스트 반환 절대 금지)
+
+응답 JSON 구조:
+{
+  "reply": "네 페르소나와 출력 규칙(2~3줄, 말투 등)을 완벽히 지킨 용의자로서의 대답 텍스트",
+  "recommended_question": "사용자가 다음에 물어보면 좋을 핵심 추리 질문 1개"
+}
+
+[추천 질문(recommended_question) 생성 지침]
+1. 대화 시작 전 (사용자의 질문이 아직 없는 첫 호출 시):
+   - reply: (각 용의자의 첫 증언 텍스트)
+   - recommended_question: 사용자가 심문을 시작하기에 가장 적합한 첫 번째 핵심 질문을 1개 제시하라.
+2. 사용자의 질문 이후:
+   - reply: 사용자의 질문에 대한 네 페르소나에 맞는 대답.
+   - recommended_question: 방금 네가 한 대답(reply)의 모순점이나 빈틈을 파고들어, 사건의 진실(숨겨진 알리바이, 물건의 행방 등)을 밝혀낼 수 있는 예리한 후속 질문 1개를 추천하라.
 """
 
-async def get_felix_response(session_id: str, user_message: str) -> str:
-    # 새로운 세션이면 초기 설정
+async def get_felix_init(session_id: str) -> dict:
     if session_id not in sessions:
-        sessions[session_id] = {
-            "count": 0,
-            "messages": [{"role": "system", "content": SYSTEM_PROMPT}]
-        }
+        sessions[session_id] = {"count": 0, "messages": [{"role": "system", "content": SYSTEM_PROMPT}]}
     
     session = sessions[session_id]
     
-    # 4번째 질문부터는 API를 호출하지 않고 차단 로직 실행
+    # 이미 초기화되어 첫 증언이 있다면 기존 캐시된 응답 반환
+    if len(session["messages"]) > 1:
+        for msg in session["messages"]:
+            if msg["role"] == "assistant":
+                return json.loads(msg["content"])
+
+    # 시스템 노트 주입
+    init_message = "[System Note: 사용자가 방금 채팅방에 입장했습니다. 사건 당일 당신의 알리바이에 대한 '첫 증언'을 합니다.]"
+    session["messages"].append({"role": "user", "content": init_message})
+    
+    # API 호출 대신 하드코딩된 첫 증언과 추천 질문 즉시 세팅
+    bot_reply_dict = {
+        "reply": "오후에 기능 테스트 준비를 끝내고 외부 미팅을 다녀왔습니다. 돌아와 보니 FUNCTION 설계도가 보이지 않았어요. 테스트 준비물과 설계도는 따로 보관해뒀습니다.",
+        "recommended_question": "테스트 준비물은 무엇이었나요?"
+    }
+    
+    # AI가 자신이 대답한 것처럼 문맥을 기억하도록 메모리에 JSON 형태로 저장
+    bot_reply_str = json.dumps(bot_reply_dict, ensure_ascii=False)
+    session["messages"].append({"role": "assistant", "content": bot_reply_str})
+    
+    return bot_reply_dict
+
+async def get_felix_response(session_id: str, user_message: str) -> dict:
+    if session_id not in sessions:
+        sessions[session_id] = {"count": 0, "messages": [{"role": "system", "content": SYSTEM_PROMPT}]}
+    
+    session = sessions[session_id]
+    
     if session["count"] >= 3:
-        return "더 이상 질문할 수 없습니다. 현장 단서를 확인하세요."
+        return {
+            "reply": "더 이상 질문할 수 없습니다. 현장 단서를 확인하세요.",
+            "recommended_question": ""
+        }
     
-    # 질문 횟수 증가 및 사용자 질문 기록
     session["count"] += 1
-    
-    # AI에게 남은 질문 횟수를 힌트로 줄 수 있도록 시스템 힌트 추가
     context_message = f"[System Note: 현재 사용자의 {session['count']}번째 질문입니다.]\n{user_message}"
     session["messages"].append({"role": "user", "content": context_message})
     
-    # OpenAI API 호출
     response = await client.chat.completions.create(
-        model="gpt-5.6-terra",  # 요구하신 API 모델명 적용
+        model="gpt-5.6-terra",
+        response_format={"type": "json_object"},
         messages=session["messages"],
-        max_completion_tokens=150          # 2~3줄 제한 (약 150토큰 내외)
+        max_completion_tokens=250
     )
     
-    bot_reply = response.choices[0].message.content
+    bot_reply_str = response.choices[0].message.content
+    session["messages"].append({"role": "assistant", "content": bot_reply_str})
     
-    # AI의 답변 기록 유지 (다음에 문맥을 기억하도록 저장하되, System 힌트는 제외한 순수 텍스트만 관리)
-    session["messages"].append({"role": "assistant", "content": bot_reply})
-    
-    return bot_reply
+    try:
+        return json.loads(bot_reply_str)
+    except json.JSONDecodeError:
+        return {"reply": "오류가 발생했습니다.", "recommended_question": ""}
